@@ -265,4 +265,89 @@ if uploaded_excel and uploaded_pptx:
             progress_bar = st.progress(0)
             
             try:
-                prs
+                prs = Presentation(uploaded_pptx)
+                # Zakładamy, że slajd nr 1 (indeks 0) to wzorzec
+                
+                # Iteracja po posortowanej przez użytkownika liście (final_selection)
+                total = len(final_selection)
+                for i, (idx, row) in enumerate(final_selection.iterrows()):
+                    
+                    # Klonowanie slajdu
+                    new_slide = safe_duplicate_slide(prs, 0)
+                    if new_slide is None:
+                        continue # Pomijamy uszkodzony slajd
+                    
+                    # Przygotowanie danych (obsługa braku danych)
+                    def get_val(key):
+                        if key in col_map:
+                            val = row.get(col_map[key])
+                            return str(val) if pd.notna(val) else "-"
+                        return "-"
+
+                    replacements = {
+                        "{Imię}": get_val("Imię"),
+                        "{Nazwisko}": get_val("Nazwisko"),
+                        "{Firma}": get_val("Firma"),
+                        "{Branża}": get_val("Branża"),
+                        "{Grupa CC}": get_val("Grupa CC"),
+                        "{Skala Biznesu}": get_val("Skala Biznesu"),
+                        "{Katalog Członków CC - opis do 500 znaków}": get_val("Katalog Członków CC - opis do 500 znaków")
+                    }
+
+                    # Podmiana na slajdzie
+                    # Używamy list(), aby bezpiecznie modyfikować kolekcję w pętli
+                    for shape in list(new_slide.shapes):
+                        
+                        # Teksty
+                        replace_text_in_shape(shape, replacements)
+                        
+                        # Zdjęcia (po nazwie kształtu lub tekście w placeholderze)
+                        shape_name_upper = shape.name.upper()
+                        text_content = ""
+                        if shape.has_text_frame:
+                            text_content = shape.text_frame.text.strip().upper()
+
+                        # PHOTO
+                        if "PHOTO" in shape_name_upper or "PHOTO" in text_content:
+                            photo_file = str(row.get(col_map.get("Photo"), "")).lower().strip()
+                            if photo_file in images_map:
+                                replace_image_in_shape(new_slide, shape, BytesIO(images_map[photo_file]))
+                        
+                        # LOGO
+                        if "LOGO" in shape_name_upper or "LOGO" in text_content:
+                            logo_file = str(row.get(col_map.get("Logo"), "")).lower().strip()
+                            if logo_file in images_map:
+                                replace_image_in_shape(new_slide, shape, BytesIO(images_map[logo_file]))
+
+                    # Aktualizacja paska
+                    progress_bar.progress((i + 1) / total)
+                    status_text.text(f"Generuję: {replacements['{Nazwisko}']}")
+
+                # Usuwamy slajd wzorcowy (pierwszy)
+                xml_slides = prs.slides._sldIdLst
+                slides_list = list(xml_slides)
+                xml_slides.remove(slides_list[0])
+
+                # Zapis
+                output = BytesIO()
+                prs.save(output)
+                output.seek(0)
+                
+                timestamp = datetime.now().strftime("%H%M")
+                file_name = f"Katalog_CC_{timestamp}.pptx"
+                
+                status_text.success("Gotowe! ✅")
+                st.download_button(
+                    label="POBIERZ PREZENTACJĘ",
+                    data=output,
+                    file_name=file_name,
+                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    type="primary"
+                )
+
+            except Exception as e:
+                st.error(f"Wystąpił niespodziewany błąd: {e}")
+                st.exception(e)
+
+else:
+    st.write("👈 Wgraj pliki w panelu bocznym.")
