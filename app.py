@@ -11,19 +11,35 @@ import copy
 # --- KONFIGURACJA STRONY I DESIGN ---
 st.set_page_config(page_title="Generator Katalogu CC", layout="wide", page_icon="📄")
 
-# Wymuszenie stylu "Clean White" (Białe tło, czarne litery, brak kolorowych ozdobników)
+# CSS - Style i Wygląd (Poprawiony kontrast i layout)
 st.markdown("""
     <style>
-        /* Reset kolorów systemowych Streamlit */
+        /* Globalny reset do bieli i czerni */
         .stApp {
             background-color: #FFFFFF;
             color: #000000;
         }
-        /* Nagłówki */
-        h1, h2, h3, h4, h5, h6, p, label, .stMarkdown {
+        /* Wymuszenie czarnego tekstu wszędzie */
+        h1, h2, h3, h4, h5, h6, p, span, div, label, .stMarkdown {
             color: #000000 !important;
             font-family: 'Roboto', sans-serif !important;
         }
+        /* Poprawa kontrastu w SideBarze (Uploader plików) */
+        [data-testid="stSidebar"] {
+            background-color: #F4F4F4; /* Jasnoszary dla odcięcia */
+            border-right: 1px solid #000000;
+        }
+        [data-testid="stSidebar"] label {
+            font-weight: bold;
+            color: #000000 !important;
+        }
+        .stFileUploader div {
+            color: #000000 !important;
+        }
+        .stFileUploader small {
+            color: #333333 !important;
+        }
+        
         /* Przyciski */
         .stButton>button {
             width: 100%;
@@ -38,19 +54,15 @@ st.markdown("""
         .stButton>button:hover {
             background-color: #000000;
             color: #FFFFFF;
-        }
-        /* Inputy i tabele */
-        .stDataFrame, .stDataEditor {
-            border: 1px solid #000000;
-        }
-        [data-testid="stSidebar"] {
-            background-color: #F0F0F0;
-            border-right: 1px solid #000000;
-        }
-        hr {
             border-color: #000000;
         }
-        /* Ukrycie domyślnego menu Streamlit */
+        
+        /* Tabela */
+        [data-testid="stDataFrame"] {
+            border: 1px solid #000000;
+        }
+        
+        /* Ukrycie zbędnych elementów */
         #MainMenu {visibility: hidden;}
         footer {visibility: hidden;}
     </style>
@@ -58,32 +70,51 @@ st.markdown("""
 
 # --- FUNKCJE LOGICZNE ---
 
-def duplicate_slide(pres, index):
-    """
-    Klonuje slajd o podanym indeksie w tej samej prezentacji.
-    To kluczowa funkcja naprawiająca problem "pustych slajdów".
-    """
-    source = pres.slides[index]
-    blank_slide_layout = pres.slide_layouts[6] # Pusty layout
-    dest = pres.slides.add_slide(blank_slide_layout)
+def parse_scale_business(value):
+    """Zamienia tekst '1 mln PLN' na liczbę, żeby dało się sortować."""
+    if pd.isna(value): return 0.0
+    text = str(value).lower().replace(',', '.').replace(' ', '')
+    multiplier = 1.0
+    if 'mld' in text or 'b' in text: multiplier = 1_000_000_000.0
+    elif 'mln' in text or 'm' in text: multiplier = 1_000_000.0
+    elif 'tys' in text or 'k' in text: multiplier = 1_000.0
+    numbers = re.findall(r"[-+]?\d*\.\d+|\d+", text)
+    if numbers: return float(numbers[0]) * multiplier
+    return 0.0
 
-    # Kopiowanie elementów (kształtów) ze źródła do celu
-    for shape in source.shapes:
-        new_el = copy.deepcopy(shape.element)
-        dest.shapes._spTree.insert_element_before(new_el, 'p:extLst')
+def safe_duplicate_slide(pres, index):
+    """
+    Bezpieczniejsza wersja duplikowania slajdu.
+    Zamiast insert_before (które powoduje błędy XML), używamy append.
+    """
+    try:
+        source = pres.slides[index]
+        blank_slide_layout = pres.slide_layouts[6] # Pusty layout
+        dest = pres.slides.add_slide(blank_slide_layout)
 
-    # Odświeżenie relacji (aby style zadziałały)
-    for key, value in source.part.rels.items():
-        if "notesSlide" not in value.reltype:
-            dest.part.rels.add_relationship(
-                value.reltype,
-                value._target,
-                value.rId
-            )
-    return dest
+        # Kopiowanie kształtów
+        for shape in source.shapes:
+            try:
+                new_el = copy.deepcopy(shape.element)
+                dest.shapes._spTree.append(new_el) # Używamy append zamiast insert_before
+            except Exception:
+                # Jeśli jakiś specyficzny kształt powoduje błąd, pomijamy go, ale slajd powstaje
+                continue
+
+        # Próba skopiowania relacji (np. tła, stylów), ale bez crashowania apki
+        try:
+            for key, value in source.part.rels.items():
+                if "notesSlide" not in value.reltype:
+                    dest.part.rels.add_relationship(value.reltype, value._target, value.rId)
+        except:
+            pass
+            
+        return dest
+    except Exception as e:
+        print(f"Critical Slide Error: {e}")
+        return None
 
 def clean_polish_typography(text):
-    """Zapobiega wiszącym spójnikom."""
     if not isinstance(text, str): return text
     conjunctions = [" w ", " z ", " i ", " a ", " o ", " u ", " na ", " do "]
     for word in conjunctions:
@@ -92,262 +123,146 @@ def clean_polish_typography(text):
     return text
 
 def replace_text_in_shape(shape, replacements):
-    """Szuka i zamienia tekst wewnątrz kształtu (TextFrame)."""
-    if not shape.has_text_frame:
-        return
-
-    # Iterujemy po akapitach i fragmentach tekstu
+    if not shape.has_text_frame: return
     for paragraph in shape.text_frame.paragraphs:
         for run in paragraph.runs:
+            # Zachowujemy oryginalny tekst, żeby podmieniać w nim klucze
+            original_text = run.text
             for key, value in replacements.items():
-                if key in run.text:
-                    # Podmiana tekstu
-                    new_text = run.text.replace(key, str(value))
-                    run.text = new_text
+                if key in original_text:
+                    new_val = str(value)
                     
-                    # Logika zmniejszania czcionki dla długich opisów (tylko dla Opisu)
+                    # Logika typografii i wielkości czcionki tylko dla opisu
                     if key == "{Katalog Członków CC - opis do 500 znaków}":
-                        clean_text = clean_polish_typography(str(value))
-                        run.text = run.text.replace(str(value), clean_text) # Aplikujemy typografię
-                        if len(str(value)) > 600:
-                            run.font.size = Pt(8)
-                        elif len(str(value)) > 450:
-                            run.font.size = Pt(9)
+                        new_val = clean_polish_typography(new_val)
+                        if len(new_val) > 600: run.font.size = Pt(8)
+                        elif len(new_val) > 450: run.font.size = Pt(9)
+                    
+                    original_text = original_text.replace(key, new_val)
+            
+            # Przypisujemy zmieniony tekst
+            run.text = original_text
 
 def replace_image_in_shape(slide, shape, image_stream):
-    """Podmienia kształt o nazwie/tekście PHOTO lub LOGO na obrazek."""
     try:
-        # Pobieramy wymiary starego kształtu
         left, top = shape.left, shape.top
         width, height = shape.width, shape.height
-        
-        # Wstawiamy nowy obrazek w to samo miejsce
         slide.shapes.add_picture(image_stream, left, top, width, height)
-        
         # Usuwamy stary kształt (placeholder)
-        # Hack: przesuwamy stary kształt poza slajd lub usuwamy z XML
         sp = shape._element
         sp.getparent().remove(sp)
-    except Exception as e:
-        print(f"Błąd obrazka: {e}")
+    except:
+        pass
 
 # --- INTERFEJS ---
 
 st.title("Generator Katalogu CC")
-st.markdown("---")
 
-# 1. SIDEBAR - PLIKI
+# 1. SIDEBAR
 with st.sidebar:
-    st.header("Wgraj pliki")
-    uploaded_excel = st.file_uploader("1. Excel (Dane)", type=['xlsx', 'csv'])
-    uploaded_pptx = st.file_uploader("2. Szablon (.pptx)", type=['pptx'])
-    uploaded_zip = st.file_uploader("3. Zdjęcia (.zip)", type=['zip'])
-    
-    # Przycisk odwrócenia kontrastu (prostym hackiem CSS - opcjonalnie)
+    st.header("1. Wgraj pliki")
+    uploaded_excel = st.file_uploader("Baza Danych (Excel)", type=['xlsx', 'csv'])
+    uploaded_pptx = st.file_uploader("Szablon (.pptx)", type=['pptx'])
+    uploaded_zip = st.file_uploader("Zdjęcia (.zip)", type=['zip'])
     st.markdown("---")
-    st.markdown("**Ustawienia:**")
-    st.caption("Sortowanie i filtrowanie dostępne po wgraniu plików.")
+    st.write("Wskazówka: Nazwy plików zdjęć w Excelu muszą pasować do plików w ZIP.")
 
+# 2. GŁÓWNA LOGIKA
 if uploaded_excel and uploaded_pptx:
-    # 2. PRZETWARZANIE DANYCH
-    try:
-        if uploaded_excel.name.endswith('.csv'):
-            df = pd.read_csv(uploaded_excel)
-        else:
-            df = pd.read_excel(uploaded_excel)
+    # Ładowanie danych
+    if uploaded_excel.name.endswith('.csv'):
+        df = pd.read_csv(uploaded_excel)
+    else:
+        df = pd.read_excel(uploaded_excel)
+    
+    df.columns = df.columns.str.strip()
+
+    # Mapowanie kolumn
+    wanted_cols = ["Imię", "Nazwisko", "Firma", "Branża", "Katalog Członków CC - opis do 500 znaków", "Grupa CC", "Skala Biznesu", "Photo", "Logo"]
+    
+    # Inteligentne szukanie nazw kolumn
+    col_map = {}
+    for wc in wanted_cols:
+        match = next((c for c in df.columns if wc.lower() in c.lower()), None)
+        # Specjalne traktowanie opisu, żeby nie pomylić z innymi
+        if wc == "Katalog Członków CC - opis do 500 znaków":
+             match = next((c for c in df.columns if "500" in c), None)
+        # Specjalne traktowanie Photo/Logo
+        if wc == "Photo": match = next((c for c in df.columns if "photo" in c.lower() and "nazwa" in c.lower()), None) or match
+        if wc == "Logo": match = next((c for c in df.columns if "logo" in c.lower() and "nazwa" in c.lower()), None) or match
         
-        # Usuwamy spacje z nazw kolumn
-        df.columns = df.columns.str.strip()
+        if match: col_map[wc] = match
+
+    # Przygotowanie DF do wyświetlenia
+    display_cols = ["Imię", "Nazwisko", "Firma", "Branża", "Skala Biznesu", "Grupa CC"]
+    # Upewniamy się, że mamy zmapowane kolumny
+    final_display_cols = [col_map[c] for c in display_cols if c in col_map]
+    
+    # Kopia robocza
+    df_view = df.copy()
+    
+    # Tworzenie kolumny sortującej (ukrytej) dla Skali Biznesu
+    if "Skala Biznesu" in col_map:
+        df_view["_sort_scale"] = df_view[col_map["Skala Biznesu"]].apply(parse_scale_business)
+
+    # Domyślnie wszyscy zaznaczeni
+    df_view.insert(0, "Wybierz", True)
+
+    st.subheader("2. Lista do wygenerowania")
+    st.info("Możesz sortować listę klikając w nagłówki kolumn (np. Skala Biznesu).")
+
+    # EDYTOR DANYCH (TABELA)
+    # Wyświetlamy tylko potrzebne kolumny + kolumnę do sortowania (którą ukryjemy wizualnie w configu)
+    cols_to_show = ["Wybierz"] + final_display_cols
+    if "_sort_scale" in df_view.columns:
+        # Sortujemy wstępnie wg Skali (malejąco) jeśli istnieje, bo użytkownik o to pytał
+        df_view = df_view.sort_values(by="_sort_scale", ascending=False)
+
+    edited_df = st.data_editor(
+        df_view,
+        column_order=cols_to_show,
+        hide_index=True,
+        height=400,
+        use_container_width=True
+    )
+
+    # 3. FILTROWANIE (POD LISTĄ)
+    st.subheader("3. Filtrowanie Grup")
+    
+    if "Grupa CC" in col_map:
+        group_col = col_map["Grupa CC"]
+        all_groups = df[group_col].dropna().unique().tolist()
+        # Domyślnie brak filtru (wszyscy), czy domyślnie wszyscy zaznaczeni?
+        # User chciał wybierać dla jakiej grupy wygenerować.
+        selected_groups = st.multiselect("Zaznacz grupy do uwzględnienia:", all_groups, default=all_groups)
         
-        # WYMAGANE KOLUMNY (Tylko te importujemy do widoku)
-        wanted_columns = [
-            "Imię", 
-            "Nazwisko", 
-            "Firma", 
-            "Branża", 
-            "Katalog Członków CC - opis do 500 znaków", 
-            "Grupa CC",
-            "Photo", # Potrzebne do logiki, ale nie musimy wyświetlać w edytorze jeśli nie chcesz
-            "Logo"
+        # Logika: bierzemy to co user "wyklikał" w tabeli (edited_df) I filtrujemy to grupami
+        # Ważne: edited_df zawiera stan checkboxów "Wybierz".
+        final_selection = edited_df[
+            (edited_df["Wybierz"] == True) & 
+            (edited_df[group_col].isin(selected_groups))
         ]
-        
-        # Mapowanie nazw (jeśli w pliku są "Photo nazwa pliku" zamiast "Photo")
-        # Prosta logika szukania odpowiedników
-        final_cols = []
-        for w_col in wanted_columns:
-            found = False
-            for df_col in df.columns:
-                if w_col.lower() in df_col.lower() and "opis" not in df_col.lower(): # Unikamy pomyłki przy Photo/Opis
-                    final_cols.append(df_col)
-                    found = True
-                    break
-                # Specjalny przypadek dla długiego opisu
-                if "opis" in w_col.lower() and "opis" in df_col.lower() and "500" in df_col.lower():
-                    final_cols.append(df_col)
-                    found = True
-                    break
-            if not found:
-                # Jeśli nie znaleziono idealnego dopasowania, szukamy luźniej lub zostawiamy
-                pass
+    else:
+        final_selection = edited_df[edited_df["Wybierz"] == True]
 
-        # Filtrujemy DF do wymaganych kolumn (plus te, które udało się znaleźć)
-        # Dla bezpieczeństwa bierzemy te, które na pewno są
-        valid_cols = [c for c in wanted_columns if c in df.columns]
-        
-        # Jeśli brakuje kluczowych, próbujemy mapować ręcznie dla Twoich plików
-        # (Hardcode pod Twoje pliki CSV, żeby zawsze działało)
-        if "Photo nazwa pliku" in df.columns: 
-            df["Photo"] = df["Photo nazwa pliku"]
-            valid_cols.append("Photo")
-        if "Logo nazwa pliku" in df.columns: 
-            df["Logo"] = df["Logo nazwa pliku"]
-            valid_cols.append("Logo")
+    st.write(f"Wybrano **{len(final_selection)}** slajdów do wygenerowania.")
 
-        # Tworzymy czysty widok
-        display_cols = ["Imię", "Nazwisko", "Firma", "Branża", "Grupa CC"]
-        # Sprawdzamy czy istnieją w df
-        display_cols = [c for c in display_cols if c in df.columns]
-        
-        # Sortowanie i Filtrowanie
-        col_L, col_R = st.columns([1, 2])
-        
-        with col_L:
-            st.subheader("Filtrowanie")
-            if "Grupa CC" in df.columns:
-                all_groups = df["Grupa CC"].dropna().unique().tolist()
-                selected_groups = st.multiselect("Wybierz Grupy:", all_groups, default=all_groups)
-                df_filtered = df[df["Grupa CC"].isin(selected_groups)].copy()
-            else:
-                df_filtered = df.copy()
+    # Ładowanie zdjęć
+    images_map = {}
+    if uploaded_zip:
+        with zipfile.ZipFile(uploaded_zip) as z:
+            for f in z.namelist():
+                if not f.endswith('/') and "__MACOSX" not in f:
+                    images_map[f.split('/')[-1].lower()] = z.read(f)
 
-        with col_R:
-            st.subheader("Lista do wygenerowania")
-            # Sortowanie
-            sort_mode = st.selectbox("Sortuj według:", ["Domyślne", "Nazwisko A-Z", "Firma A-Z"])
-            if sort_mode == "Nazwisko A-Z" and "Nazwisko" in df_filtered.columns:
-                df_filtered = df_filtered.sort_values("Nazwisko")
-            elif sort_mode == "Firma A-Z" and "Firma" in df_filtered.columns:
-                df_filtered = df_filtered.sort_values("Firma")
-
-            # Dodajemy kolumnę "Wybierz"
-            df_filtered.insert(0, "Wybierz", True)
+    # 4. GENEROWANIE
+    st.markdown("---")
+    if st.button("GENERUJ PREZENTACJĘ"):
+        if final_selection.empty:
+            st.error("Lista jest pusta. Zaznacz rekordy lub zmień filtry.")
+        else:
+            status_text = st.empty()
+            progress_bar = st.progress(0)
             
-            # Edytor danych (Tylko wybrane kolumny widoczne)
-            edited_df = st.data_editor(
-                df_filtered[["Wybierz"] + display_cols], # Pokazujemy tylko proste kolumny
-                hide_index=True,
-                height=300,
-                use_container_width=True
-            )
-            
-            # Pobieramy ID wybranych wierszy (indeksy z oryginalnego DF_filtered)
-            # Ponieważ data_editor zwraca zmodyfikowany DF, musimy połączyć go z resztą danych (Photo, Logo, Opis)
-            # Najbezpieczniej: bierzemy indeksy z edited_df gdzie Wybierz=True i filtrujemy df_filtered
-            selected_indices = edited_df[edited_df["Wybierz"] == True].index
-            final_data = df_filtered.loc[selected_indices]
-
-        # Ładowanie ZIP ze zdjęciami
-        images_map = {}
-        if uploaded_zip:
-            with zipfile.ZipFile(uploaded_zip) as z:
-                for f in z.namelist():
-                    if not f.endswith('/'): 
-                         # Klucz: sama nazwa pliku małymi literami
-                        images_map[f.split('/')[-1].lower()] = z.read(f)
-
-        # 3. GENEROWANIE
-        st.markdown("---")
-        if st.button("GENERUJ SLAJDY"):
-            if final_data.empty:
-                st.error("Nie wybrano żadnych osób.")
-            else:
-                prs = Presentation(uploaded_pptx)
-                
-                # Zamiast używać "Layoutu", KLONUJEMY pierwszy slajd
-                # Zakładamy, że slajd 0 to Twój wzorzec narysowany ręcznie
-                template_slide_index = 0 
-                
-                progress_bar = st.progress(0)
-                
-                for i, (idx, row) in enumerate(final_data.iterrows()):
-                    # 1. Sklonuj slajd wzorcowy
-                    new_slide = duplicate_slide(prs, template_slide_index)
-                    
-                    # 2. Przygotuj dane do podmiany
-                    # Pobieramy bezpiecznie, nawet jak kolumna nie istnieje
-                    def val(col_name):
-                        if col_name in df.columns:
-                            v = row[col_name]
-                            return str(v) if pd.notna(v) else "-"
-                        return "-"
-
-                    replacements = {
-                        "{Imię}": val("Imię"),
-                        "{Nazwisko}": val("Nazwisko"),
-                        "{Firma}": val("Firma"),
-                        "{Branża}": val("Branża"),
-                        "{Grupa CC}": val("Grupa CC"),
-                        "{Skala Biznesu}": val("Skala Biznesu"), # Jeśli jest w excelu
-                        "{Katalog Członków CC - opis do 500 znaków}": val("Katalog Członków CC - opis do 500 znaków")
-                    }
-
-                    # 3. Iterujemy po kształtach na NOWYM slajdzie i podmieniamy
-                    # Musimy użyć list(new_slide.shapes), bo będziemy usuwać niektóre (przy podmianie zdjęć)
-                    for shape in list(new_slide.shapes):
-                        
-                        # A. Podmiana Tekstu
-                        if shape.has_text_frame:
-                            replace_text_in_shape(shape, replacements)
-                            
-                            # Sprawdzamy czy to placeholder tekstowy PHOTO/LOGO (jeśli user wpisał tekst zamiast Alt Text)
-                            txt = shape.text_frame.text.strip()
-                            if txt == "PHOTO" or txt == "{PHOTO}":
-                                photo_name = str(row.get("Photo", "")).lower().strip()
-                                if photo_name in images_map:
-                                    replace_image_in_shape(new_slide, shape, BytesIO(images_map[photo_name]))
-                                    
-                            elif txt == "LOGO" or txt == "{LOGO}":
-                                logo_name = str(row.get("Logo", "")).lower().strip()
-                                if logo_name in images_map:
-                                    replace_image_in_shape(new_slide, shape, BytesIO(images_map[logo_name]))
-
-                        # B. Podmiana po nazwie kształtu (Selection Pane)
-                        # Jeśli nazwałeś kształt np. "PHOTO_PLACEHOLDER"
-                        if "PHOTO" in shape.name.upper():
-                            photo_name = str(row.get("Photo", "")).lower().strip()
-                            if photo_name in images_map:
-                                replace_image_in_shape(new_slide, shape, BytesIO(images_map[photo_name]))
-                        
-                        if "LOGO" in shape.name.upper():
-                            logo_name = str(row.get("Logo", "")).lower().strip()
-                            if logo_name in images_map:
-                                replace_image_in_shape(new_slide, shape, BytesIO(images_map[logo_name]))
-
-                    progress_bar.progress((i + 1) / len(final_data))
-
-                # Na koniec usuwamy slajd wzorcowy (pierwszy), żeby nie było go w wynikowym pliku
-                # (Hack na usunięcie slajdu w python-pptx)
-                xml_slides = prs.slides._sldIdLst
-                slides_list = list(xml_slides)
-                xml_slides.remove(slides_list[0])
-
-                # Zapis
-                output = BytesIO()
-                prs.save(output)
-                output.seek(0)
-                
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-                st.success("Gotowe!")
-                st.download_button(
-                    "POBIERZ PLIK .PPTX",
-                    data=output,
-                    file_name=f"Katalog_CC_{timestamp}.pptx",
-                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
-                )
-
-    except Exception as e:
-        st.error(f"Wystąpił błąd: {e}")
-        st.write("Sprawdź czy nazwy kolumn w Excelu są poprawne.")
-
-else:
-    st.info("👈 Wgraj pliki w menu po lewej stronie.")
+            try:
+                prs
