@@ -2,419 +2,352 @@ import streamlit as st
 import pandas as pd
 from pptx import Presentation
 from pptx.util import Pt
-from pptx.dml.color import RGBColor
 from io import BytesIO
 import zipfile
 import re
 from datetime import datetime
+import copy
 
-# --- KONFIGURACJA STRONY ---
+# --- KONFIGURACJA STRONY I DESIGN ---
 st.set_page_config(page_title="Generator Katalogu CC", layout="wide", page_icon="📄")
 
-# CSS - Style i Wygląd
+# Wymuszenie stylu "Clean White" (Białe tło, czarne litery, brak kolorowych ozdobników)
 st.markdown("""
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700&display=swap');
-        html, body, [class*="css"]  {
-            font-family: 'Roboto', sans-serif;
+        /* Reset kolorów systemowych Streamlit */
+        .stApp {
+            background-color: #FFFFFF;
+            color: #000000;
         }
-        h1 { color: #000000; }
+        /* Nagłówki */
+        h1, h2, h3, h4, h5, h6, p, label, .stMarkdown {
+            color: #000000 !important;
+            font-family: 'Roboto', sans-serif !important;
+        }
+        /* Przyciski */
         .stButton>button {
             width: 100%;
-            border-radius: 5px;
+            border-radius: 0px;
+            border: 2px solid #000000;
             height: 3em;
-            background-color: #000000;
-            color: #ffffff;
+            background-color: #FFFFFF;
+            color: #000000;
             font-weight: bold;
+            transition: all 0.3s;
         }
-        /* Ciemny motyw obsługiwany jest automatycznie przez Streamlit,
-           ale tutaj wymuszamy pewne akcenty dla czytelności */
+        .stButton>button:hover {
+            background-color: #000000;
+            color: #FFFFFF;
+        }
+        /* Inputy i tabele */
+        .stDataFrame, .stDataEditor {
+            border: 1px solid #000000;
+        }
+        [data-testid="stSidebar"] {
+            background-color: #F0F0F0;
+            border-right: 1px solid #000000;
+        }
+        hr {
+            border-color: #000000;
+        }
+        /* Ukrycie domyślnego menu Streamlit */
+        #MainMenu {visibility: hidden;}
+        footer {visibility: hidden;}
     </style>
 """, unsafe_allow_html=True)
 
-# --- FUNKCJE POMOCNICZE ---
+# --- FUNKCJE LOGICZNE ---
 
-def parse_scale_business(value):
+def duplicate_slide(pres, index):
     """
-    Zamienia tekst '1 mln PLN', '2,5 mld' na liczbę (float) do sortowania.
+    Klonuje slajd o podanym indeksie w tej samej prezentacji.
+    To kluczowa funkcja naprawiająca problem "pustych slajdów".
     """
-    if pd.isna(value):
-        return 0.0
-    
-    text = str(value).lower().replace(',', '.').replace(' ', '')
-    multiplier = 1.0
-    
-    if 'mld' in text or 'b' in text: # miliard
-        multiplier = 1_000_000_000.0
-    elif 'mln' in text or 'm' in text: # milion
-        multiplier = 1_000_000.0
-    elif 'tys' in text or 'k' in text: # tysiąc
-        multiplier = 1_000.0
-        
-    # Wyciąganie samej liczby z tekstu
-    numbers = re.findall(r"[-+]?\d*\.\d+|\d+", text)
-    if numbers:
-        return float(numbers[0]) * multiplier
-    return 0.0
+    source = pres.slides[index]
+    blank_slide_layout = pres.slide_layouts[6] # Pusty layout
+    dest = pres.slides.add_slide(blank_slide_layout)
+
+    # Kopiowanie elementów (kształtów) ze źródła do celu
+    for shape in source.shapes:
+        new_el = copy.deepcopy(shape.element)
+        dest.shapes._spTree.insert_element_before(new_el, 'p:extLst')
+
+    # Odświeżenie relacji (aby style zadziałały)
+    for key, value in source.part.rels.items():
+        if "notesSlide" not in value.reltype:
+            dest.part.rels.add_relationship(
+                value.reltype,
+                value._target,
+                value.rId
+            )
+    return dest
 
 def clean_polish_typography(text):
-    """
-    Zapobiega wiszącym spójnikom (wdowy i sieroty).
-    Zamienia spację po 'w', 'z', 'i', 'a' na twardą spację.
-    """
-    if not isinstance(text, str):
-        return text
-    
-    # Lista spójników do przyklejenia
+    """Zapobiega wiszącym spójnikom."""
+    if not isinstance(text, str): return text
     conjunctions = [" w ", " z ", " i ", " a ", " o ", " u ", " na ", " do "]
-    
     for word in conjunctions:
-        # Zamiana spacji zwykłej na twardą spację (\u00A0)
-        # Regex szuka spójnika otoczonego spacjami, ignorując wielkość liter
         pattern = re.compile(re.escape(word), re.IGNORECASE)
-        # Funkcja lambda zachowuje oryginalną wielkość liter spójnika
-        text = pattern.sub(lambda m: m.group(0).replace(' ', '\u00A0', 1), text) # zamień tylko drugą spację? 
-        # Prościej: po prostu zamieniamy spację PO spójniku na twardą.
-        
-    # Prosta metoda brute-force dla pewności (zamiast regex dla każdego):
-    for word in [" w", " z", " i", " a", " o", " u"]:
-        text = text.replace(f"{word} ", f"{word}\u00A0")
-        text = text.replace(f"{word.upper()} ", f"{word.upper()}\u00A0")
-        
+        text = pattern.sub(lambda m: m.group(0).replace(' ', '\u00A0', 1), text)
     return text
 
-def fit_text_to_shape(shape, text, max_chars=500):
-    """
-    Wstawia tekst i zmniejsza czcionkę, jeśli tekst jest długi.
-    """
-    if not text:
-        text = "-"
-    
-    # Przycięcie tekstu, jeśli za długi (opcja bezpieczeństwa)
-    # text = text[:max_chars] if len(text) > max_chars else text
-    
-    # Wstawienie tekstu
-    text_frame = shape.text_frame
-    text_frame.clear() # Czyścimy domyślny tekst
-    p = text_frame.paragraphs[0]
-    p.text = str(text)
-    
-    # Logika zmniejszania czcionki (prosta heurystyka)
-    # Domyślny rozmiar zakładamy, że jest ustawiony w szablonie.
-    # Jeśli tekst jest bardzo długi, wymuszamy mniejszy.
-    char_count = len(text)
-    if char_count > 600:
-        p.font.size = Pt(8)
-    elif char_count > 400:
-        p.font.size = Pt(10)
-    elif char_count > 200:
-        # Zostawiamy domyślną lub ustawiamy np. 12
-        pass 
-        
-    # Justowanie (opcjonalnie, jeśli szablon tego nie ma)
-    # from pptx.enum.text import PP_ALIGN
-    # p.alignment = PP_ALIGN.JUSTIFY
+def replace_text_in_shape(shape, replacements):
+    """Szuka i zamienia tekst wewnątrz kształtu (TextFrame)."""
+    if not shape.has_text_frame:
+        return
 
-def insert_image_into_shape(slide, shape, image_stream):
-    """
-    Wstawia obrazek w miejsce kształtu (Placeholder lub Shape), zachowując jego wymiary.
-    """
-    # Pobieramy wymiary i pozycję oryginalnego kształtu (placeholdera)
-    left, top = shape.left, shape.top
-    width, height = shape.width, shape.height
-    
-    # Jeśli to Placeholder typu Picture, metoda jest prosta:
-    if shape.is_placeholder and shape.placeholder_format.type == 18: # 18 = PICTURE
-        try:
-            shape.insert_picture(image_stream)
-            return
-        except:
-            pass # Jeśli się nie uda, robimy metodą manualną
-            
-    # Metoda manualna: dodajemy nowy obrazek na wierzch, stary ukrywamy/usuwamy
+    # Iterujemy po akapitach i fragmentach tekstu
+    for paragraph in shape.text_frame.paragraphs:
+        for run in paragraph.runs:
+            for key, value in replacements.items():
+                if key in run.text:
+                    # Podmiana tekstu
+                    new_text = run.text.replace(key, str(value))
+                    run.text = new_text
+                    
+                    # Logika zmniejszania czcionki dla długich opisów (tylko dla Opisu)
+                    if key == "{Katalog Członków CC - opis do 500 znaków}":
+                        clean_text = clean_polish_typography(str(value))
+                        run.text = run.text.replace(str(value), clean_text) # Aplikujemy typografię
+                        if len(str(value)) > 600:
+                            run.font.size = Pt(8)
+                        elif len(str(value)) > 450:
+                            run.font.size = Pt(9)
+
+def replace_image_in_shape(slide, shape, image_stream):
+    """Podmienia kształt o nazwie/tekście PHOTO lub LOGO na obrazek."""
     try:
-        # Dodajemy zdjęcie
-        pic = slide.shapes.add_picture(image_stream, left, top, width, height)
+        # Pobieramy wymiary starego kształtu
+        left, top = shape.left, shape.top
+        width, height = shape.width, shape.height
         
-        # Próbujemy usunąć stary kształt (placeholder) - w python-pptx to nie zawsze działa idealnie
-        # więc często po prostu przykrywamy go nowym zdjęciem.
-        # shape.element.delete() 
+        # Wstawiamy nowy obrazek w to samo miejsce
+        slide.shapes.add_picture(image_stream, left, top, width, height)
+        
+        # Usuwamy stary kształt (placeholder)
+        # Hack: przesuwamy stary kształt poza slajd lub usuwamy z XML
+        sp = shape._element
+        sp.getparent().remove(sp)
     except Exception as e:
-        print(f"Błąd wstawiania obrazka: {e}")
+        print(f"Błąd obrazka: {e}")
 
-def create_gray_placeholder(slide, shape):
-    """
-    Rysuje szary prostokąt w miejscu brakującego zdjęcia.
-    """
-    left, top = shape.left, shape.top
-    width, height = shape.width, shape.height
-    
-    # Dodajemy kształt
-    from pptx.enum.shapes import MSO_SHAPE
-    rect = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, left, top, width, height)
-    rect.fill.solid()
-    rect.fill.fore_color.rgb = RGBColor(200, 200, 200) # Szary
-    rect.line.color.rgb = RGBColor(150, 150, 150)
-    
-    # Opcjonalnie tekst "BRAK ZDJĘCIA"
-    tf = rect.text_frame
-    tf.text = "BRAK PLIKU"
-    tf.paragraphs[0].font.size = Pt(10)
-    tf.paragraphs[0].font.color.rgb = RGBColor(100, 100, 100)
+# --- INTERFEJS ---
 
-# --- GŁÓWNA APLIKACJA ---
+st.title("Generator Katalogu CC")
+st.markdown("---")
 
-st.title("Generator Katalogu CC 🚀")
-st.markdown("Aplikacja przekształca dane z Excela w gotową prezentację PowerPoint.")
-
-# 1. SIDEBAR - USTAWIENIA I PLIKI
+# 1. SIDEBAR - PLIKI
 with st.sidebar:
-    st.header("1. Wgraj pliki")
-    uploaded_excel = st.file_uploader("Baza Danych (Excel/CSV)", type=['xlsx', 'csv'])
-    uploaded_pptx = st.file_uploader("Szablon Slajdu (.pptx)", type=['pptx'])
-    uploaded_zip = st.file_uploader("Zdjęcia i Logotypy (.zip)", type=['zip'], help="Folder ze zdjęciami spakowany do ZIP.")
+    st.header("Wgraj pliki")
+    uploaded_excel = st.file_uploader("1. Excel (Dane)", type=['xlsx', 'csv'])
+    uploaded_pptx = st.file_uploader("2. Szablon (.pptx)", type=['pptx'])
+    uploaded_zip = st.file_uploader("3. Zdjęcia (.zip)", type=['zip'])
     
-    st.info("Pamiętaj: Nazwy plików w kolumnie 'Photo' i 'Logo' w Excelu muszą pasować do plików w ZIP.")
+    # Przycisk odwrócenia kontrastu (prostym hackiem CSS - opcjonalnie)
+    st.markdown("---")
+    st.markdown("**Ustawienia:**")
+    st.caption("Sortowanie i filtrowanie dostępne po wgraniu plików.")
 
-# 2. LOGIKA PRZETWARZANIA
 if uploaded_excel and uploaded_pptx:
-    # Wczytywanie danych
+    # 2. PRZETWARZANIE DANYCH
     try:
         if uploaded_excel.name.endswith('.csv'):
             df = pd.read_csv(uploaded_excel)
         else:
             df = pd.read_excel(uploaded_excel)
-            
-        # Standaryzacja nazw kolumn (usuwamy białe znaki)
+        
+        # Usuwamy spacje z nazw kolumn
         df.columns = df.columns.str.strip()
         
-        # Wymagane kolumny (mapowanie nazw z Twojego pliku)
-        # Dostosuj te nazwy jeśli w Excelu są inne!
-        col_map = {
-            "Imię": "Imię",
-            "Nazwisko": "Nazwisko",
-            "Firma": "Firma",
-            "Branża": "Branża",
-            "Skala Biznesu": "Skala Biznesu", # lub "Skala biznesu"
-            "Grupa CC": "Grupa CC", # lub "Grupa"
-            "Photo": "Photo nazwa pliku", # Nazwa pliku zdjęcia w Excelu
-            "Logo": "Logo nazwa pliku",   # Nazwa pliku logo w Excelu
-            "Opis": "Katalog Członków CC - opis do 500 znaków"
-        }
+        # WYMAGANE KOLUMNY (Tylko te importujemy do widoku)
+        wanted_columns = [
+            "Imię", 
+            "Nazwisko", 
+            "Firma", 
+            "Branża", 
+            "Katalog Członków CC - opis do 500 znaków", 
+            "Grupa CC",
+            "Photo", # Potrzebne do logiki, ale nie musimy wyświetlać w edytorze jeśli nie chcesz
+            "Logo"
+        ]
         
-        # Sprawdzamy czy kolumny istnieją (case insensitive search)
-        df_cols_lower = [c.lower() for c in df.columns]
-        
-        def get_real_col_name(target):
-            for col in df.columns:
-                if col.lower() == target.lower():
-                    return col
-            # Fallback dla specyficznych nazw z Twoich plików CSV
-            if target == "Photo nazwa pliku" and "Photo" in df.columns: return "Photo" # Czasami po prostu Photo
-            return target
+        # Mapowanie nazw (jeśli w pliku są "Photo nazwa pliku" zamiast "Photo")
+        # Prosta logika szukania odpowiedników
+        final_cols = []
+        for w_col in wanted_columns:
+            found = False
+            for df_col in df.columns:
+                if w_col.lower() in df_col.lower() and "opis" not in df_col.lower(): # Unikamy pomyłki przy Photo/Opis
+                    final_cols.append(df_col)
+                    found = True
+                    break
+                # Specjalny przypadek dla długiego opisu
+                if "opis" in w_col.lower() and "opis" in df_col.lower() and "500" in df_col.lower():
+                    final_cols.append(df_col)
+                    found = True
+                    break
+            if not found:
+                # Jeśli nie znaleziono idealnego dopasowania, szukamy luźniej lub zostawiamy
+                pass
 
-        # Aktualizujemy mapowanie o prawdziwe nazwy z pliku
-        real_col_map = {k: get_real_col_name(v) for k, v in col_map.items()}
+        # Filtrujemy DF do wymaganych kolumn (plus te, które udało się znaleźć)
+        # Dla bezpieczeństwa bierzemy te, które na pewno są
+        valid_cols = [c for c in wanted_columns if c in df.columns]
         
-        # Obliczenie wartości numerycznej dla sortowania
-        sort_col_name = real_col_map["Skala Biznesu"]
-        if sort_col_name in df.columns:
-            df["_sort_value"] = df[sort_col_name].apply(parse_scale_business)
-        else:
-            df["_sort_value"] = 0
+        # Jeśli brakuje kluczowych, próbujemy mapować ręcznie dla Twoich plików
+        # (Hardcode pod Twoje pliki CSV, żeby zawsze działało)
+        if "Photo nazwa pliku" in df.columns: 
+            df["Photo"] = df["Photo nazwa pliku"]
+            valid_cols.append("Photo")
+        if "Logo nazwa pliku" in df.columns: 
+            df["Logo"] = df["Logo nazwa pliku"]
+            valid_cols.append("Logo")
 
-        # --- SEKCJA GŁÓWNA ---
+        # Tworzymy czysty widok
+        display_cols = ["Imię", "Nazwisko", "Firma", "Branża", "Grupa CC"]
+        # Sprawdzamy czy istnieją w df
+        display_cols = [c for c in display_cols if c in df.columns]
         
-        st.divider()
-        st.subheader("2. Wybierz i Posortuj Rekordy")
+        # Sortowanie i Filtrowanie
+        col_L, col_R = st.columns([1, 2])
         
-        col1, col2 = st.columns(2)
-        with col1:
-            # Filtrowanie Grup
-            group_col = real_col_map["Grupa CC"]
-            if group_col in df.columns:
-                all_groups = df[group_col].dropna().unique().tolist()
-                selected_groups = st.multiselect("Wybierz Grupy CC:", all_groups, default=all_groups)
-                df_filtered = df[df[group_col].isin(selected_groups)].copy()
+        with col_L:
+            st.subheader("Filtrowanie")
+            if "Grupa CC" in df.columns:
+                all_groups = df["Grupa CC"].dropna().unique().tolist()
+                selected_groups = st.multiselect("Wybierz Grupy:", all_groups, default=all_groups)
+                df_filtered = df[df["Grupa CC"].isin(selected_groups)].copy()
             else:
                 df_filtered = df.copy()
-                
-        with col2:
+
+        with col_R:
+            st.subheader("Lista do wygenerowania")
             # Sortowanie
-            sort_option = st.selectbox(
-                "Sortowanie:",
-                ["Domyślne (jak w pliku)", "Skala Biznesu (Największa -> Najmniejsza)", "Nazwisko (A-Z)", "Firma (A-Z)"]
+            sort_mode = st.selectbox("Sortuj według:", ["Domyślne", "Nazwisko A-Z", "Firma A-Z"])
+            if sort_mode == "Nazwisko A-Z" and "Nazwisko" in df_filtered.columns:
+                df_filtered = df_filtered.sort_values("Nazwisko")
+            elif sort_mode == "Firma A-Z" and "Firma" in df_filtered.columns:
+                df_filtered = df_filtered.sort_values("Firma")
+
+            # Dodajemy kolumnę "Wybierz"
+            df_filtered.insert(0, "Wybierz", True)
+            
+            # Edytor danych (Tylko wybrane kolumny widoczne)
+            edited_df = st.data_editor(
+                df_filtered[["Wybierz"] + display_cols], # Pokazujemy tylko proste kolumny
+                hide_index=True,
+                height=300,
+                use_container_width=True
             )
             
-            if sort_option == "Skala Biznesu (Największa -> Najmniejsza)":
-                df_filtered = df_filtered.sort_values(by="_sort_value", ascending=False)
-            elif sort_option == "Nazwisko (A-Z)":
-                df_filtered = df_filtered.sort_values(by=real_col_map["Nazwisko"], ascending=True)
-            elif sort_option == "Firma (A-Z)":
-                df_filtered = df_filtered.sort_values(by=real_col_map["Firma"], ascending=True)
+            # Pobieramy ID wybranych wierszy (indeksy z oryginalnego DF_filtered)
+            # Ponieważ data_editor zwraca zmodyfikowany DF, musimy połączyć go z resztą danych (Photo, Logo, Opis)
+            # Najbezpieczniej: bierzemy indeksy z edited_df gdzie Wybierz=True i filtrujemy df_filtered
+            selected_indices = edited_df[edited_df["Wybierz"] == True].index
+            final_data = df_filtered.loc[selected_indices]
 
-        # Tabela do wyboru
-        df_filtered.insert(0, "Wybierz", True)
-        
-        edited_df = st.data_editor(
-            df_filtered,
-            column_config={
-                "Wybierz": st.column_config.CheckboxColumn("Generuj?", default=True),
-                "_sort_value": None # Ukrywamy kolumnę techniczną
-            },
-            hide_index=True,
-            use_container_width=True,
-            height=400
-        )
-        
-        final_selection = edited_df[edited_df["Wybierz"] == True]
-        st.markdown(f"**Liczba wybranych slajdów:** {len(final_selection)}")
-
-        # Obsługa ZIP (case insensitive mapping)
-        images_map = {} # 'nazwapliku.jpg' -> bytes
+        # Ładowanie ZIP ze zdjęciami
+        images_map = {}
         if uploaded_zip:
             with zipfile.ZipFile(uploaded_zip) as z:
-                for filename in z.namelist():
-                    # Ignorujemy foldery (__MACOSX to śmieci z Maca)
-                    if not filename.endswith('/') and '__MACOSX' not in filename:
-                        # Kluczem jest nazwa pliku małymi literami (bez ścieżki folderów)
-                        simple_name = filename.split('/')[-1].lower()
-                        images_map[simple_name] = z.read(filename)
+                for f in z.namelist():
+                    if not f.endswith('/'): 
+                         # Klucz: sama nazwa pliku małymi literami
+                        images_map[f.split('/')[-1].lower()] = z.read(f)
 
-        # --- GENEROWANIE ---
-        st.divider()
-        if st.button("GENERUJ PREZENTACJĘ ⚡", type="primary"):
-            if len(final_selection) == 0:
-                st.error("Wybierz przynajmniej jeden rekord!")
+        # 3. GENEROWANIE
+        st.markdown("---")
+        if st.button("GENERUJ SLAJDY"):
+            if final_data.empty:
+                st.error("Nie wybrano żadnych osób.")
             else:
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                # Ładowanie szablonu
                 prs = Presentation(uploaded_pptx)
-                # Zakładamy, że pierwszy slajd to wzorzec. Będziemy go powielać.
-                # W python-pptx najlepiej używać slide_layout. 
-                # Jeśli szablon ma 1 slajd, jego layout to zwykle layouty przypisane do Mastera.
-                # Użyjemy layoutu pierwszego slajdu jako bazy.
-                base_layout = prs.slides[0].slide_layout 
                 
-                # Usuwamy slajd wzorcowy z finalnej prezentacji (opcjonalnie, zależy czy user chce)
-                # Na razie zostawiamy, żeby user widział, potem usuwamy?
-                # Najlepiej: tworzymy nowe slajdy, a na końcu usuwamy pierwszy (wzorcowy).
+                # Zamiast używać "Layoutu", KLONUJEMY pierwszy slajd
+                # Zakładamy, że slajd 0 to Twój wzorzec narysowany ręcznie
+                template_slide_index = 0 
                 
-                total_slides = len(final_selection)
+                progress_bar = st.progress(0)
                 
-                for i, (index, row) in enumerate(final_selection.iterrows()):
-                    # Aktualizacja paska postępu
-                    progress = (i + 1) / total_slides
-                    progress_bar.progress(progress)
-                    status_text.text(f"Generowanie slajdu {i+1}/{total_slides}: {row.get(real_col_map['Nazwisko'], '')}")
+                for i, (idx, row) in enumerate(final_data.iterrows()):
+                    # 1. Sklonuj slajd wzorcowy
+                    new_slide = duplicate_slide(prs, template_slide_index)
                     
-                    # 1. Dodaj nowy slajd
-                    slide = prs.slides.add_slide(base_layout)
-                    
-                    # 2. Iterujemy po wszystkich kształtach na nowym slajdzie
-                    # Szukamy placeholderów i tekstów do podmiany
-                    for shape in slide.placeholders:
-                        shape_name = shape.name.upper() # np. "TXT_IMIE" lub domyślne nazwy PPT
-                        shape_text = shape.text if hasattr(shape, 'text') else ""
-                        
-                        # --- MAPOWANIE TEKSTÓW ---
-                        # Sprawdzamy czy nazwa kształtu LUB tekst w nim zawiera klucz
-                        
-                        # Funkcja do bezpiecznego pobierania wartości
-                        def get_val(key):
-                            val = row.get(real_col_map[key], "-")
-                            return val if pd.notna(val) else "-"
+                    # 2. Przygotuj dane do podmiany
+                    # Pobieramy bezpiecznie, nawet jak kolumna nie istnieje
+                    def val(col_name):
+                        if col_name in df.columns:
+                            v = row[col_name]
+                            return str(v) if pd.notna(v) else "-"
+                        return "-"
 
-                        # Imię
-                        if "{IMIĘ}" in shape_text or "IMIĘ" in shape_name or "IMIE" in shape_name:
-                            fit_text_to_shape(shape, get_val("Imię"))
-                        
-                        # Nazwisko
-                        elif "{NAZWISKO}" in shape_text or "NAZWISKO" in shape_name:
-                            fit_text_to_shape(shape, get_val("Nazwisko"))
-                            
-                        # Firma
-                        elif "{FIRMA}" in shape_text or "FIRMA" in shape_name:
-                            fit_text_to_shape(shape, get_val("Firma"))
-                            
-                        # Branża
-                        elif "{BRANŻA}" in shape_text or "BRANŻA" in shape_name or "BRANZA" in shape_name:
-                            fit_text_to_shape(shape, get_val("Branża"))
-                            
-                        # Skala
-                        elif "{SKALA" in shape_text or "SKALA" in shape_name:
-                            fit_text_to_shape(shape, get_val("Skala Biznesu"))
-                        
-                        # Grupa
-                        elif "{GRUPA" in shape_text or "GRUPA" in shape_name:
-                            fit_text_to_shape(shape, get_val("Grupa CC"))
-                            
-                        # Opis (z poprawą typografii)
-                        elif "{OPIS}" in shape_text or "OPIS" in shape_name or "500" in shape_text:
-                            raw_desc = get_val("Opis")
-                            clean_desc = clean_polish_typography(str(raw_desc))
-                            fit_text_to_shape(shape, clean_desc)
+                    replacements = {
+                        "{Imię}": val("Imię"),
+                        "{Nazwisko}": val("Nazwisko"),
+                        "{Firma}": val("Firma"),
+                        "{Branża}": val("Branża"),
+                        "{Grupa CC}": val("Grupa CC"),
+                        "{Skala Biznesu}": val("Skala Biznesu"), # Jeśli jest w excelu
+                        "{Katalog Członków CC - opis do 500 znaków}": val("Katalog Członków CC - opis do 500 znaków")
+                    }
 
-                        # --- MAPOWANIE ZDJĘĆ ---
+                    # 3. Iterujemy po kształtach na NOWYM slajdzie i podmieniamy
+                    # Musimy użyć list(new_slide.shapes), bo będziemy usuwać niektóre (przy podmianie zdjęć)
+                    for shape in list(new_slide.shapes):
                         
-                        # Zdjęcie (PHOTO)
-                        elif "PHOTO" in shape_name or "ZDJĘCIE" in shape_name:
-                            photo_file = str(row.get(real_col_map["Photo"], "")).lower().strip()
-                            if uploaded_zip and photo_file in images_map:
-                                insert_image_into_shape(slide, shape, BytesIO(images_map[photo_file]))
-                            else:
-                                create_gray_placeholder(slide, shape)
-                        
-                        # Logo (LOGO)
-                        elif "LOGO" in shape_name:
-                            logo_file = str(row.get(real_col_map["Logo"], "")).lower().strip()
-                            if uploaded_zip and logo_file in images_map:
-                                insert_image_into_shape(slide, shape, BytesIO(images_map[logo_file]))
-                            else:
-                                # create_gray_placeholder(slide, shape) # Dla logo można zostawić puste
-                                pass
-
-                    # Obsługa statycznych tekstów (nie-placeholderów), jeśli chcemy podmieniać np. "{Imię}" w zwykłym polu tekstowym
-                    for shape in slide.shapes:
+                        # A. Podmiana Tekstu
                         if shape.has_text_frame:
-                            for paragraph in shape.text_frame.paragraphs:
-                                for run in paragraph.runs:
-                                    # Prosta podmiana w tekście ciągłym
-                                    if "{Imię}" in run.text:
-                                        run.text = run.text.replace("{Imię}", str(row.get(real_col_map["Imię"], "")))
-                                    if "{Nazwisko}" in run.text:
-                                        run.text = run.text.replace("{Nazwisko}", str(row.get(real_col_map["Nazwisko"], "")))
-                                    # itd...
+                            replace_text_in_shape(shape, replacements)
+                            
+                            # Sprawdzamy czy to placeholder tekstowy PHOTO/LOGO (jeśli user wpisał tekst zamiast Alt Text)
+                            txt = shape.text_frame.text.strip()
+                            if txt == "PHOTO" or txt == "{PHOTO}":
+                                photo_name = str(row.get("Photo", "")).lower().strip()
+                                if photo_name in images_map:
+                                    replace_image_in_shape(new_slide, shape, BytesIO(images_map[photo_name]))
+                                    
+                            elif txt == "LOGO" or txt == "{LOGO}":
+                                logo_name = str(row.get("Logo", "")).lower().strip()
+                                if logo_name in images_map:
+                                    replace_image_in_shape(new_slide, shape, BytesIO(images_map[logo_name]))
 
-                # Usuwamy pierwszy slajd (wzorzec) - hack dla python-pptx
-                # (dostęp do wewnętrznej listy slajdów XML)
+                        # B. Podmiana po nazwie kształtu (Selection Pane)
+                        # Jeśli nazwałeś kształt np. "PHOTO_PLACEHOLDER"
+                        if "PHOTO" in shape.name.upper():
+                            photo_name = str(row.get("Photo", "")).lower().strip()
+                            if photo_name in images_map:
+                                replace_image_in_shape(new_slide, shape, BytesIO(images_map[photo_name]))
+                        
+                        if "LOGO" in shape.name.upper():
+                            logo_name = str(row.get("Logo", "")).lower().strip()
+                            if logo_name in images_map:
+                                replace_image_in_shape(new_slide, shape, BytesIO(images_map[logo_name]))
+
+                    progress_bar.progress((i + 1) / len(final_data))
+
+                # Na koniec usuwamy slajd wzorcowy (pierwszy), żeby nie było go w wynikowym pliku
+                # (Hack na usunięcie slajdu w python-pptx)
                 xml_slides = prs.slides._sldIdLst
-                slides = list(xml_slides)
-                xml_slides.remove(slides[0])
+                slides_list = list(xml_slides)
+                xml_slides.remove(slides_list[0])
 
                 # Zapis
                 output = BytesIO()
                 prs.save(output)
                 output.seek(0)
                 
-                # Nazwa pliku
-                timestamp = datetime.now().strftime("%Y.%m.%d_%H:%M")
-                file_name = f"Katalog_CC_Generated_{timestamp}.pptx"
-                
-                status_text.success("Gotowe! ✅")
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+                st.success("Gotowe!")
                 st.download_button(
-                    label="POBIERZ PREZENTACJĘ",
+                    "POBIERZ PLIK .PPTX",
                     data=output,
-                    file_name=file_name,
-                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                    type="primary"
+                    file_name=f"Katalog_CC_{timestamp}.pptx",
+                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
                 )
 
     except Exception as e:
-        st.error(f"Wystąpił błąd podczas przetwarzania: {e}")
-        st.write("Szczegóły błędu:", e)
+        st.error(f"Wystąpił błąd: {e}")
+        st.write("Sprawdź czy nazwy kolumn w Excelu są poprawne.")
+
 else:
-    # Ekran powitalny
-    st.info("👈 Wgraj pliki w pasku bocznym, aby rozpocząć.")
+    st.info("👈 Wgraj pliki w menu po lewej stronie.")
